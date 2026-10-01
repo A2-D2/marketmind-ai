@@ -26,6 +26,7 @@ class CompanyFinancials:
     company_name: str | None = None
     sector: str | None = None
     industry: str | None = None
+    business_summary: str | None = None
     currency: str | None = None
     current_price: float | None = None
     market_cap: float | None = None
@@ -90,6 +91,7 @@ def get_company_financials(ticker: str, history_period: str = "2y") -> CompanyFi
     result.company_name = _first_of(info, "longName", "shortName")
     result.sector = info.get("sector")
     result.industry = info.get("industry")
+    result.business_summary = info.get("longBusinessSummary")
     result.currency = info.get("currency")
     result.current_price = _num(
         _first_of(info, "currentPrice", "regularMarketPrice", "previousClose")
