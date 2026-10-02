@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Callable
 from statistics import mean
 
 from agents import Agent, Runner
@@ -158,13 +159,16 @@ def validate_output(out: FinancialResearchOutput) -> list[str]:
 
 
 async def run_financial_research(
-    fin: CompanyFinancials, model: str | None = None
+    fin: CompanyFinancials,
+    model: str | None = None,
+    on_retry: Callable[[str], None] | None = None,
 ) -> tuple[FinancialResearchOutput, Usage]:
     """Returns (analysis, token usage summed over all attempts).
 
     Validates the output; on failure retries once with corrective feedback. If the
     retry still fails, the violations are recorded in data_limitations.
-    Usage is the hook for later per-agent cost tracking.
+    Usage is the hook for later per-agent cost tracking. `on_retry(reason)` is
+    called when the corrective retry is triggered.
     """
     agent = create_financial_research_agent(model)
     prompt = build_agent_input(fin)
@@ -174,6 +178,8 @@ async def run_financial_research(
 
     violations = validate_output(out)
     if violations:
+        if on_retry:
+            on_retry(f"prohibited terms: {', '.join(violations)}")
         retry_prompt = (
             f"{prompt}\n\nYour previous answer used prohibited terms: {', '.join(violations)}. "
             "Rewrite the full analysis without them and without the conclusions they imply "

@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Callable
 from typing import Literal
 
 from agents import Agent, Runner
@@ -20,7 +21,12 @@ from agents.usage import Usage
 from pydantic import BaseModel, Field
 
 from marketmind.data.financials import CompanyFinancials
-from marketmind.data.peers import PeerCandidate, PeerResolution, resolve_peers
+from marketmind.data.peers import (
+    PeerCandidate,
+    PeerResolution,
+    ResolvedPeer,
+    resolve_peers,
+)
 from marketmind.data.web_research import WebResearchEvidence
 
 DEFAULT_MODEL = "gpt-4.1-mini"
@@ -105,6 +111,9 @@ class ComparableCompany(BaseModel):
     currency: str | None  # trading currency: price, market cap
     financial_currency: str | None  # reporting currency: revenue, net income
     listing_basis: str | None
+    # "high": agent-selected, quote-verified. "broad_peer": deterministic fallback,
+    # only identified in a peers-purpose source (lower confidence). None for the target.
+    peer_confidence: str | None
     source_ids: list[str]
     reason: str | None
     metrics: PeerMetrics
@@ -114,7 +123,9 @@ class ComparableCompany(BaseModel):
 
 class RejectedCandidate(BaseModel):
     name: str
-    stage: str  # "agent" (not comparable) | "validation" (unsupported quote) | "resolver" (listing / data)
+    # "agent" (not comparable) | "validation" (unsupported quote) | "resolver" (listing / data)
+    # | "fallback" (broad-peer fallback could not use it)
+    stage: str
     source_ids: list[str]
     reason: str
 
@@ -304,10 +315,14 @@ def _currency_warnings(fin: CompanyFinancials | None) -> list[str]:
 
 
 def build_comps_dataset(
-    target: CompanyFinancials, draft: MarketAgentDraft, resolution: PeerResolution
+    target: CompanyFinancials,
+    draft: MarketAgentDraft,
+    resolution: PeerResolution,
+    broad_reasons: dict[str, str] | None = None,
 ) -> list[ComparableCompany]:
     """Target row + one row per resolved peer, values copied as reported (no conversion)."""
-    reasons = {p.name: p.reason for p in draft.comparable_companies}
+    broad_reasons = broad_reasons or {}
+    reasons = {p.name: p.reason for p in draft.comparable_companies} | broad_reasons
     tm, tmissing = _metrics(target)
     rows = [
         ComparableCompany(
@@ -320,6 +335,7 @@ def build_comps_dataset(
             currency=target.currency,
             financial_currency=target.financial_currency,
             listing_basis=None,
+            peer_confidence=None,
             source_ids=[],
             reason=None,
             metrics=tm,
@@ -340,6 +356,7 @@ def build_comps_dataset(
                 currency=p.currency,
                 financial_currency=p.financials.financial_currency if p.financials else None,
                 listing_basis=p.listing_basis,
+                peer_confidence="broad_peer" if p.peer_name in broad_reasons else "high",
                 source_ids=p.source_ids,
                 reason=reasons.get(p.peer_name),
                 metrics=m,
@@ -350,20 +367,103 @@ def build_comps_dataset(
     return rows
 
 
+def _peer_warnings(peers: list[ResolvedPeer]) -> list[str]:
+    """Same peer-count / currency warnings as the resolver, recomputed after the fallback."""
+    warnings = []
+    if len(peers) < MIN_PEERS:
+        warnings.append(f"Only {len(peers)} valid peers resolved (target is {MIN_PEERS}-{MAX_PEERS}).")
+    currencies = sorted({p.currency for p in peers if p.currency})
+    if len(currencies) > 1:
+        warnings.append(
+            f"Peers report in multiple currencies ({', '.join(currencies)}); "
+            "values are not converted, so absolute figures are not directly comparable."
+        )
+    return warnings
+
+
+def broad_peer_fallback(
+    names: list[str],
+    ev: WebResearchEvidence,
+    target: CompanyFinancials,
+    resolution: PeerResolution,
+) -> tuple[dict[str, str], list[RejectedCandidate]]:
+    """Top up `resolution.peers` to MIN_PEERS with lower-confidence broad peers (in place).
+
+    Deterministic: candidate names (already mentioned by the agent) must appear
+    in the excerpt text (not just the title) of a source retrieved for the
+    "peers" purpose, and are
+    resolved one at a time through the existing yfinance resolver. Names found in
+    more peer sources are tried first. The reason is a fixed provenance statement,
+    never a business-overlap claim. Returns (name -> reason, fallback rejections).
+    """
+    peer_excerpts = {s.source_id: _norm(s.excerpt) for s in ev.sources if s.query_purpose == "peers"}
+    have = {_norm(p.peer_name) for p in resolution.peers}
+    seen_tickers = {ev.ticker} | {p.ticker for p in resolution.peers}
+    reasons: dict[str, str] = {}
+    rejected: list[RejectedCandidate] = []
+
+    ranked, seen_names = [], set(have)
+    for name in names:
+        if _norm(name) in seen_names:
+            continue
+        seen_names.add(_norm(name))
+        ids = [sid for sid, text in peer_excerpts.items() if _norm(name) in text]
+        if ids:
+            ranked.append((name, ids))
+        else:
+            rejected.append(RejectedCandidate(
+                name=name, stage="fallback", source_ids=[],
+                reason="not found in any peers-purpose source excerpt",
+            ))
+    ranked.sort(key=lambda c: -len(c[1]))  # stable: ties keep the agent's order
+
+    for name, ids in ranked:
+        if len(resolution.peers) >= MIN_PEERS:
+            break
+        res = resolve_peers(ev.ticker, [PeerCandidate(name, ids)], ev.sources,
+                            target.company_name, max_peers=1)
+        if not res.peers:
+            reason = res.rejected[0].reason if res.rejected else "not resolved"
+            rejected.append(RejectedCandidate(name=name, stage="fallback", source_ids=ids, reason=reason))
+            continue
+        peer = res.peers[0]
+        if peer.ticker in seen_tickers:
+            rejected.append(RejectedCandidate(
+                name=name, stage="fallback", source_ids=ids,
+                reason=f"resolves to {peer.ticker}, already included or the target",
+            ))
+            continue
+        seen_tickers.add(peer.ticker)
+        resolution.peers.append(peer)
+        reasons[name] = (
+            f"Broad peer (lower confidence): identified in peer/competitor source(s) "
+            f"{', '.join(peer.source_ids)}; the evidence does not describe specific business overlap."
+        )
+    resolution.warnings = [
+        w for w in resolution.warnings if not w.startswith(("Only ", "Peers report in multiple"))
+    ] + _peer_warnings(resolution.peers)
+    return reasons, rejected
+
+
 def _assemble(
     draft: MarketAgentDraft,
     ev: WebResearchEvidence,
     target: CompanyFinancials,
     resolution: PeerResolution,
+    broad_reasons: dict[str, str] | None = None,
 ) -> MarketResearchOutput:
-    resolved = {p.peer_name for p in resolution.peers}
+    broad_reasons = broad_reasons or {}
+    # Broad peers keep no agent-written reason, even if the agent proposed them.
+    resolved = {p.peer_name for p in resolution.peers} - broad_reasons.keys()
     used = sorted(_cited_ids(draft) & {s.source_id for s in ev.sources})
     rejected = [
         RejectedCandidate(name=x.name, stage="agent", source_ids=[], reason=x.reason)
         for x in draft.considered_but_excluded
+        if x.name not in broad_reasons
     ] + [
         RejectedCandidate(name=r.peer_name, stage="resolver", source_ids=r.source_ids, reason=r.reason)
         for r in resolution.rejected
+        if r.peer_name not in broad_reasons
     ]
     return MarketResearchOutput(
         # Ticker/company come from the retrieval layer, not the model.
@@ -385,7 +485,7 @@ def _assemble(
             for s in ev.sources
             if s.source_id in used
         ],
-        comps_dataset=build_comps_dataset(target, draft, resolution),
+        comps_dataset=build_comps_dataset(target, draft, resolution, broad_reasons),
         rejected_peers=rejected,
         data_limitations=draft.data_limitations,
         warnings=ev.warnings + resolution.warnings,
@@ -393,13 +493,18 @@ def _assemble(
 
 
 async def run_market_research(
-    ev: WebResearchEvidence, target: CompanyFinancials, model: str | None = None
+    ev: WebResearchEvidence,
+    target: CompanyFinancials,
+    model: str | None = None,
+    on_retry: Callable[[str], None] | None = None,
 ) -> tuple[MarketResearchOutput, Usage]:
     """Returns (analysis + deterministic comps dataset, token usage summed over all attempts).
 
     Validates grounding; on failure retries once with corrective feedback. If the
     retry still fails, the problems are recorded in data_limitations. Peer names
-    are then verified, resolved to listings and enriched by code.
+    are then verified, resolved to listings and enriched by code. If fewer than
+    MIN_PEERS survive, broad_peer_fallback tops up with lower-confidence peers.
+    `on_retry(reason)` is called when the corrective retry is triggered.
     """
     if not ev.sources:
         raise ValueError(f"No web evidence for {ev.ticker}: {'; '.join(ev.warnings)}")
@@ -412,6 +517,8 @@ async def run_market_research(
 
     problems = validate_output(draft, ev)
     if problems:
+        if on_retry:
+            on_retry("; ".join(problems))
         retry_prompt = (
             f"{prompt}\n\nYour previous answer had grounding problems: {'; '.join(problems)}. "
             "Rewrite the full analysis citing only existing source_ids. Keep only peers whose "
@@ -433,12 +540,20 @@ async def run_market_research(
     resolution = resolve_peers(
         ev.ticker, candidates, ev.sources, target.company_name, max_peers=MAX_PEERS
     )
-    out = _assemble(draft, ev, target, resolution)
+    broad_reasons: dict[str, str] = {}
+    fallback_rejected: list[RejectedCandidate] = []
+    if len(resolution.peers) < MIN_PEERS:
+        names = [p.name for p in draft.comparable_companies if p.name in unsupported]
+        names += [x.name for x in draft.considered_but_excluded]
+        names += [r.peer_name for r in resolution.rejected]
+        broad_reasons, fallback_rejected = broad_peer_fallback(names, ev, target, resolution)
+
+    out = _assemble(draft, ev, target, resolution, broad_reasons)
     out.rejected_peers += [
         RejectedCandidate(
             name=p.name, stage="validation", source_ids=p.source_ids, reason=unsupported[p.name]
         )
         for p in draft.comparable_companies
-        if p.name in unsupported
-    ]
+        if p.name in unsupported and p.name not in broad_reasons
+    ] + fallback_rejected
     return out, usage

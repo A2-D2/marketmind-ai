@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Callable
 
 from agents import Agent, Runner
 from agents.usage import Usage
@@ -169,12 +170,15 @@ def _attach_source(out: FilingsAgentDraft, ev: FilingEvidence) -> FilingsResearc
 
 
 async def run_filings_research(
-    ev: FilingEvidence, model: str | None = None
+    ev: FilingEvidence,
+    model: str | None = None,
+    on_retry: Callable[[str], None] | None = None,
 ) -> tuple[FilingsResearchOutput, Usage]:
     """Returns (analysis with code-attached provenance, token usage summed over all attempts).
 
     Validates grounding; on failure retries once with corrective feedback. If the
     retry still fails, the problems are recorded in data_limitations.
+    `on_retry(reason)` is called when the corrective retry is triggered.
     """
     if not ev.excerpts:
         raise ValueError(f"No filing evidence for {ev.ticker}: {'; '.join(ev.warnings)}")
@@ -187,6 +191,8 @@ async def run_filings_research(
 
     problems = validate_output(out, ev)
     if problems:
+        if on_retry:
+            on_retry("; ".join(problems))
         retry_prompt = (
             f"{prompt}\n\nYour previous answer had grounding problems: {'; '.join(problems)}. "
             "Rewrite the full analysis citing only existing evidence_ids and verbatim quotes."
